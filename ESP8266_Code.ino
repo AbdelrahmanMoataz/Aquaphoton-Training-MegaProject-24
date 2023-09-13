@@ -1,7 +1,9 @@
 #include <NewPingESP8266.h>
-#include "ESP8266_Start.h"
-//#include "ESP8266_Server_Control.h"
+#include "ESP8266_Server_Control.h"
 //NOTE: all serial usage is only for testing, will be removed in code uploaded to car to free up the RX and TX pins
+
+// #################################################################### VARIABLES AND DEFINITIONS ####################################################################
+
 // Pin Name Definitions (+ Shift Register Definitions):
 
 //Sensors
@@ -53,34 +55,28 @@ float V_ACTUAL = 0.0; // Actual voltage reading
 bool SENSOR_TURN = true; // Starts at current sensor by default
 
 //GUI data variables
+String sensor_send;
 String dir_cmd_GUI;
 char mode_GUI;
 float dist_GUI;
-int motor_speed_GUI;
+int motor_speed_GUI = 255; //Default is at max speed
 
 //Shift register control byte
 byte CTRL_SR = 0;
 
 //Motor variables
-int motor_speed = 255; // Default is at max speed 
 bool turnoff = true; // Car is at rest at start
 
 //millis() variables
 unsigned long SENSOR_TIME = 0;
+unsigned long prevtime_S = 0;  // Send to server
 unsigned long prevtime_U = 0;  // Ultrasonic sensor
 unsigned long prevtime_C = 0;  // Current sensor
 unsigned long prevtime_M = 0;  // Motor
 
+// #################################################################### SETUP AND LOOP ########################################################################
+
 void setup() {
-  //Starting WiFi functions using our library
-  Serial.begin(115200);
-  delay(10);
-  Serial.println('\n');
-  startWiFi();                 // Start a Wi-Fi access point, and try to connect to some given access points. Then wait for either an AP or STA connection
-  startOTA();                  // Start the OTA service
-  startMDNS();                 // Start the mDNS responder
-  startServer();               // Start a HTTP server with a file read handler and an upload handler
-  
   // Define GPIOs
   pinMode(A0,INPUT);
   pinMode(16,INPUT);
@@ -94,30 +90,49 @@ void setup() {
   pinMode(15,OUTPUT);
 
   // Initial States
-  digitalWrite(CURRENT_SENSOR,HIGH); // PNP transistors are used which are turned on at LOW signal to base
+  digitalWrite(CURRENT_SENSOR,LOW); // PNP transistors are used which are turned on at LOW signal to base. Start with current sensor at base
   digitalWrite(VOLTAGE_SENSOR,HIGH);
   CTRL_SR = 0b00001110; // Motor IN pins, RGB LEDs, Ultrasonic indicator all turned off 
                         // Note: RGB LED used is common anode. The microcontroller is connected to the each diode's cathode and so they are active LOW
   updateShiftRegister();
 
+  //Starting WiFi functions using our library
+  startServer();               // Startup all WiFi services
 }
 
 void loop() {
-  MDNS.update(); // Required for the mDNS server to be detetected by the computer
-  ArduinoOTA.handle();                        // listen for OTA events
+  // Activate OTA if connected to WiFi
+  handleOTA();
+  // Receive HTTP request 
+  takeRequest();
+  // Read then send sensor data to server
   sensorRead();
+  // After receiving HTTP request, check if it is a command and update GUI variables
+  takeAction(receiveCommand());
+  // Control RGB LED
   RGBLED();
+  // Control motion of car
   carDirectionControl(mode_GUI);
+  // Always check if connection is lost, wait for reconnection
+  if(onConnectionLoss()){
+    turnOFF();
+    RGBLED();
+    waitForConnection(); // Stay in loop until car reconnects
+  };
 }
 
-// FUNCTION DEFINITIONS:
 
+// #################################################################### FUNCTION DEFINITIONS #######################################################################
+
+// Shift Register Function
 void updateShiftRegister(){
    digitalWrite(LATCH_SR, LOW);
    shiftOut(DATA_SR, CLK_SR, MSBFIRST, CTRL_SR);  //MSBFIRST used so byte in CLK is same as the byte "CTRL_SR" and not reversed
    digitalWrite(LATCH_SR, HIGH);
 }
 
+// Sensor read and send function
+int i = 0; // Counter for current sensor
 void sensorRead(){
     // Ultrasonic Sensor:
     if(millis()-prevtime_U > 33){
@@ -125,51 +140,81 @@ void sensorRead(){
       distance_U = speed * time_U / 2.0; // we divide by 2 to account for travelling back distance
       prevtime_U = millis();
     }
-    ////////////////////////// Function to send to GUI
 
     // Current and voltage sensor switching:
     if(SENSOR_TURN){
+      sensor_send.reserve(30);// reserve 30 bytes for sensor_send string
     // Current Sensor:
       if(millis() - prevtime_C > 3){
-        for(int i = 0; i < 100; i++ ){ // Get 100 samples of reading, giving 3 millisecond delay between each reading for ADC to settle
-          ACS_OUT = analogRead(CURRENT_SENSOR);
-          samples +=  ACS_OUT;
-          prevtime_C = millis();
-          if(i == 99){
-            ACS_OUT_AVG = samples / 100.0;
-            samples = 0; // Reset samples variable to be used next reading
-            ACS_CURRENT = ((ACS_OUT_AVG * 5 / 1024) - 2.5) / 0.185; // convert from digital to analogue volt, subtract the offset(from datasheet) then divide by sensitivity(from datasheet)
-          }
+        ACS_OUT = analogRead(CURRENT_SENSOR);
+        samples +=  ACS_OUT;
+        prevtime_C = millis();
+        i++;
+        if(i == 100){
+          i = 0;
+          ACS_OUT_AVG = samples / 100.0;
+          samples = 0; // Reset samples variable to be used next reading
+          ACS_CURRENT = ((ACS_OUT_AVG  * 3.3 / 1024) - 2.5 + 0.7 ) / 0.185 + 0.02; // convert from digital to analogue volt (3.3V is max of ESP), add the diode voltage drop,
+                                                                                   // subtract the offset(from datasheet) then divide by sensitivity(from datasheet)
+                                                                                   // Finally, add the 10mA going to 12V indicator LED and 10mA consumed by ACS712
         }
       }
-      ////////////////////////// Function to send to GUI
-      if(millis()-SENSOR_TIME > 1000){ // Every 1 second, switch sensor being read
-      SENSOR_TURN = !SENSOR_TURN;
-      digitalWrite(CURRENT_SWITCH,HIGH); // Current sensor off, voltage sensor on
-      digitalWrite(VOLTAGE_SWITCH,LOW);
-      } 
     }
-
     else{
       // Voltage Sensor:
       V_SENSOR = analogRead(VOLTAGE_SENSOR);
-      V_ACTUAL = (V_SENSOR * 5 / 1024) * (R1+R2)/R2; // (R1+R2)/R2 = 5
-      ////////////////////////// Function to send to GUI
-      if(millis()-SENSOR_TIME > 1000){ // Every 1 second, switch sensor being read
+      V_ACTUAL = (V_SENSOR * 3.3 / 1024) * (R1+R2)/R2 + 0.7; // (R1+R2)/R2 = 5 , add the diode voltage drop
+    }
+
+    // Sensor switching code
+    if(millis()-SENSOR_TIME > 1000){ // Every 1 second, switch sensor being read
       SENSOR_TURN = !SENSOR_TURN;
-      digitalWrite(CURRENT_SWITCH,LOW); // Current sensor on, voltage sensor off
-      digitalWrite(VOLTAGE_SWITCH,HIGH);
+      digitalWrite(CURRENT_SWITCH,!digitalRead(CURRENT_SWITCH)); // switch the sensor being activated
+      digitalWrite(VOLTAGE_SWITCH,!digitalRead(VOLTAGE_SWITCH));
+      SENSOR_TIME = millis();
     } 
-  }
+
+    // Sending data to GUI every 50ms
+    if(millis() - prevtime_S > 50){
+      sensor_send = String(distance_U) + "." + String(ACS_CURRENT) + "." + String(V_ACTUAL);
+      sendData(sensor_send);
+      prevtime_S = millis();
+    }
+    
 }
 
+// Receive data from GUI function
+void takeAction(String command){
+  switch(command[0]){
+      case 'd':
+      dir_cmd_GUI = command.substring(1);
+      break;
+      
+      case 'S':
+      motor_speed_GUI = command.substring(1).toInt();
+      break;
+
+      case 'M':
+      mode_GUI = command.charAt(1);
+      break;
+
+      case 'D':
+      dist_GUI = command.substring(1).toFloat();
+      break;
+
+      default:
+      break;
+    }
+}
+
+// RGB LED control
 void RGBLED(){
-  if(motor_speed >= 170){
+  if(motor_speed_GUI >= 170){
     bitClear(CTRL_SR,RED);
     bitSet(CTRL_SR,BLUE);
     bitSet(CTRL_SR,GREEN);
   } 
-  else if(motor_speed >= 85 ){
+  else if(motor_speed_GUI >= 85 ){
     bitSet(CTRL_SR,RED);
     bitSet(CTRL_SR,BLUE);
     bitClear(CTRL_SR,GREEN);
@@ -180,7 +225,7 @@ void RGBLED(){
     bitSet(CTRL_SR,GREEN);
   }
 
-  if(motor_speed == 0 || turnoff){ //Notice that this if condition is put after the previous three so that RGB LED is not blue while car is stopped.
+  if(motor_speed_GUI == 0 || turnoff){ // Notice that this if condition is put after the previous three so that RGB LED is not blue while car is stopped.
     bitSet(CTRL_SR,RED);
     bitSet(CTRL_SR,BLUE);
     bitSet(CTRL_SR,GREEN);
@@ -188,32 +233,21 @@ void RGBLED(){
   updateShiftRegister(); // Updates the shift register output after changing the control byte
 }
 
-void carDirectionControl(char mode){
-  switch(mode){
-    case 'M': // Manual driving, controlled by GUI
-      motorControl(dir_cmd_GUI,1000);
-      break;
+// Motor control functions
 
-    case 'A': // Autonomous (PID LATER) (ultrasonic will be on right side of car)
-      if( (distance_U > dist_GUI * 0.95) && (distance_U < dist_GUI * 1.05) ) //5% tolerance for distance to be detected as correct
-        digitalWrite(ULTRASONIC_LED,HIGH);
-      else
-        digitalWrite(ULTRASONIC_LED,LOW);
-      if(distance_U < dist_GUI){ // Too close to wall, need to go left
-        motorControl("LEFT",200);
-      }
-      else{ // Otherwise go right
-        motorControl("RIGHT",200);
-      }
-    break;
-
-    default:  //default mode is manual
-    mode_GUI = 'M';
-    break;
-  }
+void turnON(){
+  turnoff = false; // Related to RGB LED
+  analogWrite(EN1,motor_speed_GUI);
+  analogWrite(EN2,motor_speed_GUI);
 }
 
-void motorControl(String direction,unsigned int time){ //max time that can be set will 
+void turnOFF(){  // Turnoff, only write do enable pins for free motor stopping instead of fast motor stopping
+  turnoff = true; // Related to RGB LED
+  digitalWrite(EN1,LOW);
+  digitalWrite(EN2,LOW);
+}
+
+void motorControl(String direction,unsigned int time){
     if(direction == "FORWARD"){
       prevtime_M = millis();
       turnON();
@@ -249,27 +283,37 @@ void motorControl(String direction,unsigned int time){ //max time that can be se
       bitClear(CTRL_SR,IN3);
       bitClear(CTRL_SR,IN4);
     }
+
+    dir_cmd_GUI = "" // Reset the direction after executing function once
+
     if(millis()-prevtime_M > time)  //If no inputs were received within "time", the car stops
       turnOFF();
     updateShiftRegister(); // Updates the shift register output after changing the control byte
 }
 
-void turnON(){
-  turnoff = false; // Related to RGB LED
-  analogWrite(EN1,motor_speed);
-  analogWrite(EN2,motor_speed);
+
+void carDirectionControl(char mode){
+  switch(mode){
+    case 'M': // Manual driving, controlled by GUI
+      motorControl(dir_cmd_GUI,3000);
+      break;
+
+    case 'A': // Autonomous (PID LATER) (ultrasonic will be on right side of car)
+      if((distance_U > dist_GUI * 0.95) && (distance_U < dist_GUI * 1.05)) //5% tolerance for distance to be detected as correct
+        bitSet(CTRL_SR,ULTRASONIC_LED);
+      else
+        bitClear(CTRL_SR,ULTRASONIC_LED);
+      updateShiftRegister();
+
+      if(distance_U < dist_GUI) // Too close to wall, need to go left
+        motorControl("LEFT",200);
+      else // Otherwise go right
+        motorControl("RIGHT",200);
+    break;
+
+    default:  //default mode is manual
+    mode_GUI = 'M';
+    break;
+  }
 }
 
-void turnOFF(){           // Turnoff functions also makes sure that when turnON is called none of the IN pins are high (avoid unwanted movement)
-  turnoff = true; // Related to RGB LED
-  digitalWrite(EN1,LOW);
-  digitalWrite(EN2,LOW);
-  bitClear(CTRL_SR,IN1);
-  bitClear(CTRL_SR,IN2);
-  bitClear(CTRL_SR,IN3);
-  bitClear(CTRL_SR,IN4);
-}
-
-/*void onConnectionLoss(){
-
-}*/
